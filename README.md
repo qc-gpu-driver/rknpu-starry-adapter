@@ -1,72 +1,71 @@
 # rknpu-starry-adapter
 
-`rknpu-starry-adapter` 是一个 **StarryOS <-> rknpu** 的桥接层（adapter）：
+`rknpu-starry-adapter` 是 `StarryOS <-> rknpu` 的桥接层。
 
-- 向上对接 StarryOS 的驱动注册/IRQ/MMIO/电源域框架（`rdrive` / `axklib` / `rockchip-pm`）
-- 向下复用 `rknpu` 的核心能力（`Rknpu`、`RknpuIrqHandler`、提交与中断处理）
+这个 crate 不实现 NPU 算法本身，职责是把：
 
-这个 crate 的职责是“接线”和“平台适配”，不是重写 NPU 算法逻辑。
+- `rknpu` 的核心驱动能力（MMIO/IRQ/submit/GEM）
+- StarryOS 的设备模型、devfs、用户态拷贝、调度与电源域
 
-## 设计定位
+接到一起，并对外提供可注册的设备与 probe 入口。
 
-- `npuprobe.rs`：FDT 探测 + MMIO 映射 + IRQ 注册 + 驱动发布
-- `irq.rs`：将平台 IRQ 回调转发到 `RknpuIrqHandler`
-- `power.rs`：上电流程（NPU/NPUTOP/NPU1/NPU2）
-- `tool.rs`：`iomap` 等平台工具胶水
+## 主要职责
 
-## extern crate 约定（明确要求）
+- FDT probe：识别 `rockchip,rk3588-rknpu`，映射寄存器，注册 IRQ。
+- 上电流程：拉起 NPU/NPUTOP/NPU1/NPU2 power domain。
+- IRQ 桥接：平台 IRQ 回调转发到 `RknpuIrqHandler::handle()`。
+- 设备节点实现：
+  - `/dev/dri/card0`（基础 DRM 信息 ioctl）
+  - `/dev/dri/card1`（DRM + RKNPU driver ioctl）
+  - `/dev/rknpu`（复用 card1 设备语义）
+- 在 `card1` 内接入 `RknpuService<StarryPlatform>`，把等待/唤醒/worker 运行时接到 StarryOS。
 
-本适配层采用 `extern crate` 的方式引入关键依赖（`no_std` 场景下可读性和边界更清晰）：
+## 代码结构
 
-```rust
-#![no_std]
-
-extern crate alloc;
-#[macro_use]
-extern crate log;
-extern crate rknpu;
-extern crate rdrive;
-extern crate rockchip_pm;
-extern crate axklib;
-#[cfg(target_arch = "aarch64")]
-extern crate axtask;
+```text
+rknpu-starry-adapter/
+├── src/
+│   ├── lib.rs           // 对外导出与模块拼装
+│   ├── card0.rs         // /dev/dri/card0
+│   ├── card1.rs         // /dev/dri/card1 + /dev/rknpu 主要 ioctl/mmap
+│   ├── devfs.rs         // 设备节点注册函数 register_rknpu_devices
+│   └── drm.rs           // DRM ioctl 辅助结构与解码
+├── npuprobe.rs          // FDT probe + MMIO + IRQ + driver register
+├── irq.rs               // 全局 IRQ slot 与 trampoline
+├── power.rs             // power domain 上电 + irq_yield
+└── tool.rs              // iomap 工具封装
 ```
 
-## 防止 extern 被优化掉：KeepAlive 宏
+## 对外入口
 
-当开启 LTO/裁剪时，如果某个外部 crate 只被“间接使用”，可能被链接器激进裁剪。  
-建议使用一个 `#[used]` 锚点宏显式保活符号：
+- `rknpu_probe`：由 `module_driver!` 注册为 FDT probe 回调。
+- `enable_pm`：可被外部显式调用的上电 helper。
+- `register_rknpu_devices(fs, root)`：将 `/dev/rknpu` 和 `/dev/dri/card{0,1}` 挂到 devfs。
 
-```rust
-#[macro_export]
-macro_rules! keep_extern_symbol {
-    ($keep_fn:ident, $keep_static:ident, $sym:path) => {
-        #[inline(never)]
-        fn $keep_fn() {
-            let _ = $sym;
-        }
+注意：`npuprobe.rs` 只负责平台注册（`plat_dev.register(npu)`）和 IRQ 接线，不会自动调用 `register_rknpu_devices()`；设备节点需要在 OS 的 devfs 初始化路径显式注册。
 
-        #[used]
-        static $keep_static: fn() = $keep_fn;
-    };
-}
+## StarryOS 侧语义依赖
 
-// 示例：保活来自 extern crate 的符号
-keep_extern_symbol!(
-    __keep_rdrive_get_one,
-    __KEEP_RDRIVE_GET_ONE,
-    rdrive::get_one::<rockchip_pm::RockchipPM>
-);
+`card1` 的平台适配实现依赖以下语义：
+
+- 用户态内存拷贝：`axhal::asm::user_copy`。
+- 提交等待：`starry_core::futex::WaitQueue`。
+- worker 事件：`event_listener::Event`。
+- worker 线程与让出：`axtask::spawn` / `axtask::yield_now`（`aarch64`）。
+- 设备获取：`rdrive::get_one::<rknpu::Rknpu>()`。
+
+如果迁移到其他 OS，需要按 `rknpu::service` 的平台 trait 重新实现这些语义。
+
+
+## `extern crate` 约定
+
+本 crate 保持 `no_std` + `extern crate` 显式引入风格，入口见 `src/lib.rs`。  
+如果后续开启更激进的 LTO/裁剪并出现“间接依赖符号被裁掉”的问题，再补 `#[used]` 锚点宏（例如 keep-extern-symbol 模式）即可；当前代码中未强制启用该宏。
+
+## 构建检查
+
+```bash
+cargo check --manifest-path /home/inkbottle/othersrc/npu/drivers/rknpu-starry-adapter/Cargo.toml
 ```
 
-说明：
-
-- `#[used]` 保证静态锚点不会在编译期被移除
-- 通过函数内 `let _ = $sym;` 建立对 extern 符号的显式引用
-- 宏参数拆为函数名/静态名，避免重名冲突
-
-## 编译建议
-
-- 该 crate 应作为独立包编译：`cargo check --manifest-path drivers/rknpu-starry-adapter/Cargo.toml`
-- 若目标是 `aarch64`，需确保 `axtask` 与 StarryOS 运行时环境可用
-# rknpu-starry-adapter
+如果出现路径依赖错误，先校准上面的目录布局，再做编译。
