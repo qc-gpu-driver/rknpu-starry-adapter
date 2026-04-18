@@ -5,7 +5,7 @@ use core::{
 
 use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
 use axhal::asm::user_copy;
-use starry_core::vfs::DeviceOps;
+use starry_kernel::pseudofs::DeviceOps;
 
 use crate::drm::{DrmVersion, io_size, ioctl_nr, is_driver_ioctl};
 

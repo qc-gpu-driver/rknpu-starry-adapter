@@ -15,14 +15,14 @@ pub static NPU_IRQ_HANDLERS: [IrqSlot; 3] = [
 ];
 
 /// Static trampoline table registered with the platform IRQ framework.
-pub const NPU_IRQ_FNS: [fn(usize); 3] = [
+pub const NPU_IRQ_FNS: [fn(); 3] = [
     handle_npu_irq_core0,
     handle_npu_irq_core1,
     handle_npu_irq_core2,
 ];
 
 /// IRQ entry point for NPU core 0.
-fn handle_npu_irq_core0(_irq: usize) {
+fn handle_npu_irq_core0() {
     unsafe {
         if let Some(h) = &*NPU_IRQ_HANDLERS[0].0.get() {
             h.handle();
@@ -31,7 +31,7 @@ fn handle_npu_irq_core0(_irq: usize) {
 }
 
 /// IRQ entry point for NPU core 1.
-fn handle_npu_irq_core1(_irq: usize) {
+fn handle_npu_irq_core1() {
     unsafe {
         if let Some(h) = &*NPU_IRQ_HANDLERS[1].0.get() {
             h.handle();
@@ -40,7 +40,7 @@ fn handle_npu_irq_core1(_irq: usize) {
 }
 
 /// IRQ entry point for NPU core 2.
-fn handle_npu_irq_core2(_irq: usize) {
+fn handle_npu_irq_core2() {
     unsafe {
         if let Some(h) = &*NPU_IRQ_HANDLERS[2].0.get() {
             h.handle();

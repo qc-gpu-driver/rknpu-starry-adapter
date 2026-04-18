@@ -12,15 +12,11 @@ use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
 use axtask::future::block_on;
 use event_listener::Event;
 use lazy_static::lazy_static;
-use memory_addr::{MemoryAddr, PhysAddrRange};
 use rknpu::service::{
     RknpuCmd, RknpuDeviceAccess, RknpuSchedulerRuntime, RknpuService, RknpuServiceError,
     RknpuSubmitWaiter, RknpuUserMemory, RknpuWorkerListener, RknpuWorkerSignal,
 };
-use starry_core::{
-    futex::WaitQueue,
-    vfs::{DeviceMmap, DeviceOps},
-};
+use starry_kernel::pseudofs::{DeviceMmap, DeviceOps};
 
 use crate::{
     card0::{copy_from_user, copy_to_user},
@@ -64,21 +60,19 @@ pub struct DrmUnique {
     pub unique: *mut c_char,
 }
 
-const SUBMIT_WAIT_MASK: u32 = u32::MAX;
-
 #[derive(Default, Clone, Copy)]
 struct StarryPlatform;
 
 struct StarrySubmitWaiter {
     done: AtomicBool,
-    wait_queue: WaitQueue,
+    event: Event,
 }
 
 impl StarrySubmitWaiter {
     fn new() -> Self {
         Self {
             done: AtomicBool::new(false),
-            wait_queue: WaitQueue::new(),
+            event: Event::new(),
         }
     }
 }
@@ -86,21 +80,23 @@ impl StarrySubmitWaiter {
 impl RknpuSubmitWaiter for StarrySubmitWaiter {
     fn wait(&self) -> Result<(), RknpuServiceError> {
         while !self.done.load(Ordering::Acquire) {
-            self.wait_queue
-                .wait_if(SUBMIT_WAIT_MASK, None, || {
-                    !self.done.load(Ordering::Acquire)
-                })
-                .map_err(|err| match err {
-                    AxError::Interrupted => RknpuServiceError::Interrupted,
-                    _ => RknpuServiceError::InvalidData,
-                })?;
+            #[cfg(target_arch = "aarch64")]
+            {
+                let listener = self.event.listen();
+                if self.done.load(Ordering::Acquire) {
+                    break;
+                }
+                let _ = block_on(listener);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            core::hint::spin_loop();
         }
         Ok(())
     }
 
     fn complete(&self) {
         self.done.store(true, Ordering::Release);
-        self.wait_queue.wake(usize::MAX, SUBMIT_WAIT_MASK);
+        self.event.notify_relaxed(usize::MAX);
     }
 }
 
@@ -180,7 +176,7 @@ impl RknpuSchedulerRuntime for StarryPlatform {
         F: FnOnce() + Send + 'static,
     {
         #[cfg(target_arch = "aarch64")]
-        axtask::spawn(f, "rknpu-scheduler".to_string());
+        axtask::spawn_with_name(f, "rknpu-scheduler".to_string());
         #[cfg(not(target_arch = "aarch64"))]
         {
             let _ = f;
@@ -203,8 +199,8 @@ lazy_static! {
 fn map_vfs_to_service_error(err: VfsError) -> RknpuServiceError {
     match err {
         VfsError::NotFound => RknpuServiceError::NotFound,
-        VfsError::AddressInUse => RknpuServiceError::Busy,
-        VfsError::BadIoctl => RknpuServiceError::BadIoctl,
+        VfsError::AddrInUse => RknpuServiceError::Busy,
+        VfsError::OperationNotSupported => RknpuServiceError::BadIoctl,
         _ => RknpuServiceError::InvalidData,
     }
 }
@@ -214,9 +210,9 @@ fn map_service_error(err: RknpuServiceError) -> VfsError {
         RknpuServiceError::InvalidInput => VfsError::InvalidInput,
         RknpuServiceError::InvalidData => VfsError::InvalidData,
         RknpuServiceError::NotFound => VfsError::NotFound,
-        RknpuServiceError::Busy => VfsError::AddressInUse,
+        RknpuServiceError::Busy => VfsError::AddrInUse,
         RknpuServiceError::Interrupted => AxError::Interrupted.into(),
-        RknpuServiceError::BadIoctl => VfsError::BadIoctl,
+        RknpuServiceError::BadIoctl => VfsError::OperationNotSupported,
         RknpuServiceError::Driver(_) | RknpuServiceError::Internal => VfsError::InvalidData,
     }
 }
@@ -269,7 +265,7 @@ impl DeviceOps for Card1 {
                 rknpu_driver_ioctl(op, arg)?;
             } else {
                 warn!("Unknown RKNPU cmd: {:#x}", cmd);
-                return Err(VfsError::BadIoctl);
+                return Err(VfsError::OperationNotSupported);
             }
         } else {
             assert!(nr <= MAX_IOCTL_NR, "card1: unsupported ioctl nr {nr}");
@@ -316,38 +312,10 @@ impl DeviceOps for Card1 {
     }
 
     /// Maps device memory to user space
-    fn mmap(&self, offset: u64) -> DeviceMmap {
-        const PAGE_SHIFT: u32 = 12;
-        const PAGE_SIZE: usize = 4096;
-
-        let handle = (offset >> PAGE_SHIFT) as u32;
-
-        with_npu(|rknpu_dev| {
-            match rknpu_dev.get_phys_addr_and_size(handle) {
-                Some((phys_addr, size)) => {
-                    let range_size = if size < PAGE_SIZE {
-                        PAGE_SIZE
-                    } else {
-                        size.align_up(PAGE_SIZE) // 向上对齐
-                    };
-
-                    info!(
-                        "card1: mmap handle={}, phys={:#x}, orig_size={:#x}, range_size={:#x}",
-                        handle, phys_addr, size, range_size
-                    );
-
-                    Ok(DeviceMmap::Physical(PhysAddrRange::new(
-                        (phys_addr as usize).into(),
-                        (phys_addr as usize + range_size).into(),
-                    )))
-                }
-                None => {
-                    warn!("card1: mmap invalid handle={}", handle);
-                    Ok(DeviceMmap::None)
-                }
-            }
-        })
-        .unwrap_or(DeviceMmap::None)
+    fn mmap(&self) -> DeviceMmap {
+        // The current StarryOS DeviceOps API has no mmap offset parameter,
+        // so userspace-handle based GEM mmap cannot be resolved here yet.
+        DeviceMmap::None
     }
 }
 
@@ -356,7 +324,7 @@ pub fn npu() -> Result<rdrive::DeviceGuard<::rknpu::Rknpu>, VfsError> {
     rdrive::get_one()
         .ok_or(VfsError::NotFound)?
         .lock()
-        .map_err(|_| VfsError::AddressInUse)
+        .map_err(|_| VfsError::AddrInUse)
 }
 
 /// Executes a function with the NPU device

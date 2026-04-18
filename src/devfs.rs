@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 
 use axfs_ng_vfs::NodeType;
-use starry_core::vfs::{Device, DirMapping, SimpleDir, SimpleFs};
+use starry_kernel::pseudofs::{Device, DirMapping, SimpleDir, SimpleFs};
 
 use crate::card0::{CARD0_SYSTEM_DEVICE_ID, Card0};
 use crate::card1::{CARD1_SYSTEM_DEVICE_ID, RKNPU_DEVICE_ID, Card1};

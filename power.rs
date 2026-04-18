@@ -1,5 +1,5 @@
-use rockchip_pm::PD;
-use rockchip_pm::RockchipPM;
+use core::ptr::NonNull;
+use rockchip_pm::{PowerDomain, RkBoard, RockchipPM};
 
 
 
@@ -23,27 +23,32 @@ pub(crate) fn irq_yield() {
 /// This helper turns on the top-level NPU domain and the individual subdomains
 /// before MMIO access or IRQ setup begins.
 pub fn enable_pm() {
+    // RK3588 PMU base address from SoC memory map / DTS.
+    const RK3588_PMU_BASE: u64 = 0xfd8d8000;
+    const RK3588_PMU_SIZE: usize = 0x1000;
+
     // RK3588 NPU-related power-domain identifiers.
+    const NPU: PowerDomain = PowerDomain(8);
+    const NPUTOP: PowerDomain = PowerDomain(9);
+    const NPU1: PowerDomain = PowerDomain(10);
+    const NPU2: PowerDomain = PowerDomain(11);
 
-    /// Main NPU power domain.
-    pub const NPU: PD = PD(8);
-    /// Top-level NPU power domain.
-    pub const NPUTOP: PD = PD(9);
-    /// NPU1 power domain.
-    pub const NPU1: PD = PD(10);
-    /// NPU2 power domain.
-    pub const NPU2: PD = PD(11);
-
-    let mut pm = rdrive::get_one::<RockchipPM>().unwrap().lock().unwrap();
+    let pm_base = axklib::mem::iomap((RK3588_PMU_BASE as usize).into(), RK3588_PMU_SIZE)
+        .expect("failed to iomap RK3588 PMU");
+    let mut pm = RockchipPM::new(
+        unsafe { NonNull::new_unchecked(pm_base.as_mut_ptr()) },
+        RkBoard::Rk3588,
+    );
 
     // Power domains are brought up explicitly so later register accesses and
     // submissions do not touch a gated NPU block.
-    pm.power_domain_on(NPUTOP).unwrap();
-    pm.power_domain_on(NPU).unwrap();
-    pm.power_domain_on(NPU1).unwrap();
-    pm.power_domain_on(NPU2).unwrap();
+    pm.power_domain_on(NPUTOP)
+        .expect("failed to enable PM domain NPUTOP");
+    pm.power_domain_on(NPU)
+        .expect("failed to enable PM domain NPU");
+    pm.power_domain_on(NPU1)
+        .expect("failed to enable PM domain NPU1");
+    pm.power_domain_on(NPU2)
+        .expect("failed to enable PM domain NPU2");
 }
-
-
-
 
